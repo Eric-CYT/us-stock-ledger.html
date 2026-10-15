@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src https://api.finmindtrade.com https://api.github.com; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src https://api.finmindtrade.com https://finnhub.io https://api.github.com; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
 <meta name="color-scheme" content="light dark">
@@ -773,7 +773,7 @@ const Engine = (function () {
       const row = {
         asset: a, qty: p.qty, cost: p.cost, avgCost: p.avgCost, realized: p.realized,
         bought: p.boughtCost, sold: p.soldProceeds + p.returned, dividends: p.dividends,
-        price: q ? q.price : null, pct: q && q.pct != null ? q.pct : null, src: q ? q.src : null, date: q ? q.date : null,
+        price: q ? q.price : null, pct: q && q.pct != null ? q.pct : null, src: q ? q.src : null, date: q ? q.date : null, rt: !!(q && q.rt), at: q ? q.at : null,
         value: null, unrealized: null, unrealizedPct: null,
       };
       if (q) {
@@ -1283,6 +1283,18 @@ const Market = (function () {
   const FM = 'https://api.finmindtrade.com/api/v4/data';
   const INFO_KEY = 'usstockledger.info.v1';
   let token = '';
+  let fhKey = '';
+  const FH = 'https://finnhub.io/api/v1/quote';
+  function setFhKey(k) { fhKey = (k || '').trim(); }
+  /** Finnhub 即時報價（盤中為最新成交價；收盤後為當日收盤）。查無代號回傳 null */
+  async function fhQuote(code) {
+    const res = await fetchWithTimeout(FH + '?' + new URLSearchParams({ symbol: code, token: fhKey }).toString(), 10000);
+    if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; e.src = 'Finnhub'; throw e; }
+    const j = await res.json();
+    if (!j || !(+j.c > 0)) return null;
+    const ts = +j.t > 0 ? j.t * 1000 : Date.now();
+    return { price: +j.c, pct: j.dp != null && isFinite(+j.dp) ? +j.dp : (+j.pc > 0 ? (+j.c / +j.pc - 1) * 100 : null), date: mktDateStr(ts), at: ts, src: 'Finnhub', rt: true };
+  }
 
   function setToken(t) { token = (t || '').trim(); }
 
@@ -1330,7 +1342,13 @@ const Market = (function () {
     const unknown = [];
     let limited = false, netErr = null;
     const start = mktDateStr(Date.now() - 20 * DAY);
+    let fhErr = null;
     await pool(codes, 4, async (c) => {
+      // 有 Finnhub Key 先抓即時價；查不到或 Key 失效、超過次數時改用 FinMind 收盤價
+      if (fhKey && !fhErr) {
+        try { const q = await fhQuote(c); if (q) { prices[c] = q; return; } }
+        catch (e) { if (e.status === 401 || e.status === 403 || e.status === 429) fhErr = e; }
+      }
       if (limited) return;
       try {
         const rows = (await fm({ dataset: 'USStockPrice', data_id: c, start_date: start })).filter((r) => closeOf(r) > 0);
@@ -1349,7 +1367,7 @@ const Market = (function () {
       throw e;
     }
     const missing = codes.filter((c) => !prices[c] && unknown.indexOf(c) < 0);
-    return { prices, unknown, missing, limited };
+    return { prices, unknown, missing, limited, fhErr: fhErr ? (fhErr.status === 429 ? 'Finnhub 每分鐘查詢次數已達上限' : 'Finnhub API Key 無效或沒有權限（HTTP ' + fhErr.status + '）') : null };
   }
 
   /** 日收盤（美東日期）。回傳 [{day, close}]，day 為美東當日 00:00 的時間戳，升冪 */
@@ -1403,7 +1421,7 @@ const Market = (function () {
     return map;
   }
 
-  return { setToken, fetchQuotes, fetchDailyCloses, fetchCorpActions, fetchFx, fetchInfo, cachedInfo };
+  return { setToken, setFhKey, fetchQuotes, fetchDailyCloses, fetchCorpActions, fetchFx, fetchInfo, cachedInfo };
 })();
 
 /* ===== charts.js ===== */
@@ -1946,6 +1964,7 @@ function normalize(d) {
   st.fxManual = st.fxManual > 0 ? +st.fxManual : null;
   delete st.feeDiscount; delete st.oddMinFee;
   st.fmToken = typeof st.fmToken === 'string' ? st.fmToken.trim() : '';
+  st.fhKey = typeof st.fhKey === 'string' ? st.fhKey.trim() : '';
   st.cur = st.cur === 'TWD' ? 'TWD' : 'USD';
   const asRaw = d.alertState || {};
   for (const k in asRaw) {
@@ -2125,7 +2144,7 @@ function lastTradePx() {
 /** 價格資訊：收盤報價 > 手動 > 最近成交價 */
 function priceInfo(asset) {
   const m = market.prices[asset];
-  if (m && m.price > 0) return { price: m.price, pct: m.pct, src: 'live', date: m.date };
+  if (m && m.price > 0) return { price: m.price, pct: m.pct, src: 'live', date: m.date, rt: !!m.rt, at: m.at };
   const mp = data.manualPrices[asset];
   if (mp > 0) return { price: mp, pct: null, src: 'manual' };
   const lt = lastTradePx()[asset];
@@ -2225,6 +2244,7 @@ async function refreshPrices(missingOnly) {
     Object.keys(market.prices).forEach((a) => { if (held.indexOf(a) < 0) delete market.prices[a]; });
     market.unknown = missingOnly === true ? market.unknown.filter((a) => held.indexOf(a) >= 0).concat(res.unknown) : res.unknown;
     market.limited = res.limited;
+    market.fhErr = res.fhErr || null;
     market.status = 'ok'; market.error = null; market.updatedAt = Date.now();
   }
   updateStatus();
@@ -2347,7 +2367,8 @@ function armIdle() {
 function priceStale() {
   if (!market.updatedAt) return true;
   const age = Date.now() - market.updatedAt;
-  return age > (mktOpen(Date.now()) ? 30 * 60000 : 60 * 60000);
+  const live = !!(data && data.settings.fhKey);
+  return age > (mktOpen(Date.now()) ? (live ? 55000 : 30 * 60000) : (live ? 15 * 60000 : 60 * 60000));
 }
 function startTimers() {
   stopTimers();
@@ -2541,7 +2562,8 @@ function updateStatus() {
   let latest = '';
   Object.keys(market.prices).forEach((a) => { const d = market.prices[a].date; if (d && d > latest) latest = d; });
   el.statusText.textContent =
-    st === 'ok' ? (latest ? '收盤價 ' + latest.slice(5).replace('-', '/') + ' · ' : '') + fmtTime(market.updatedAt) + ' 更新'
+    st === 'ok' && Object.keys(market.prices).some((a) => market.prices[a].rt) ? (mktOpen(Date.now()) ? '即時報價 · ' : '報價 ' + latest.slice(5).replace('-', '/') + ' · ') + fmtTime(market.updatedAt) + ' 更新'
+    : st === 'ok' ? (latest ? '收盤價 ' + latest.slice(5).replace('-', '/') + ' · ' : '') + fmtTime(market.updatedAt) + ' 更新'
       : st === 'loading' ? '更新報價中…'
         : st === 'error' ? '報價更新失敗' : '尚未更新';
 }
@@ -2557,6 +2579,7 @@ function renderNotices(C) {
   if (market.status === 'error') list.push(notice('無法取得美股報價（' + market.error + '）。目前以手動價格或最近成交價估值。', ['重試', refreshPrices]));
   if (market.status === 'ok' && market.limited) list.push(notice('FinMind 免費查詢次數已用完，部分個股暫時沒有報價，約一小時後恢復；可在「設定」填入 FinMind Token 提高額度。'));
   if (data.settings.cur === 'TWD' && C.cur !== 'TWD' && data.txs.length && fx.status !== 'loading') list.push(notice('目前沒有可用的匯率，暫時以美元顯示。'));
+  if (market.status === 'ok' && market.fhErr) list.push(notice(market.fhErr + '，目前改用 FinMind 收盤價。請到「設定」檢查 Finnhub API Key。'));
   if (fx.status === 'error' && data.txs.length) list.push(notice('無法取得美元匯率（' + fx.error + '）。' + (fxNowInfo() ? '台幣換算暫時改用' + (fxNowInfo().src === 'manual' ? '設定裡的手動匯率' : '最近一筆交易的匯率') + '。' : '請到「設定」填入手動匯率，才能顯示台幣金額。'), ['重試', () => loadFx(true)]));
   if (market.unknown.length) list.push(notice('查不到「' + market.unknown.join('、') + '」的報價（代號可能有誤、已下市或 FinMind 沒有收錄），請在持股表用「設定價格」手動輸入。'));
   if (C.result.issues.length) {
@@ -3094,7 +3117,8 @@ function renderHoldings(C) {
     const needSet = r.src !== 'live';
     const priceCell = h('td', { 'data-label': '現價' },
       r.price != null ? fmtPrice(cur === 'TWD' && C.fxNow > 0 ? r.price / C.fxNow : r.price, 'USD') : '—',
-      r.src === 'live' && r.date ? h('span', { class: 'badge', title: '收盤日期' }, r.date.slice(5).replace('-', '/')) : null,
+      r.src === 'live' && r.rt && r.at && mktOpen(Date.now()) && Date.now() - r.at < 6 * 3600000 ? h('span', { class: 'badge', title: '即時報價（最後成交時間）' }, '即時 ' + pad2(new Date(r.at).getHours()) + ':' + pad2(new Date(r.at).getMinutes()))
+        : r.src === 'live' && r.date ? h('span', { class: 'badge', title: r.rt ? '報價日期' : '收盤日期' }, r.date.slice(5).replace('-', '/')) : null,
       r.src === 'manual' ? h('span', { class: 'badge', title: '手動輸入的價格' }, '手動') : null,
       r.src === 'trade' ? h('span', { class: 'badge', title: '沒有報價，暫用最近一筆成交價' }, '成交價') : null,
       needSet ? h('button', { class: 'btn link', type: 'button', onclick: () => openPriceDialog(r.asset) }, '設定價格') : null);
@@ -4031,6 +4055,7 @@ function enterApp(sess, d) {
   renderAll();
   armIdle();
   Market.setToken(data.settings.fmToken);
+  Market.setFhKey(data.settings.fhKey);
   loadStockInfo();
   startTimers();
   refreshPrices();
@@ -4203,6 +4228,16 @@ function quoteSection() {
         persist(); toast(data.settings.fmToken ? '已儲存 Token' : '已清除 Token'); refreshPrices();
       } }, '儲存')),
     h('span', { class: 'hint' }, 'Token 跟帳本一起加密保存在這台裝置，不會同步到雲端。')));
+  const inFh = h('input', { id: 'fh-key', type: 'password', value: data.settings.fhKey || '', autocomplete: 'off', spellcheck: 'false', placeholder: '選填' });
+  box.appendChild(h('div', { class: 'field' }, h('label', { for: 'fh-key' }, 'Finnhub API Key（選填，即時報價）'),
+    h('div', { class: 'inline' }, inFh,
+      h('button', { class: 'btn', type: 'button', onclick: () => {
+        data.settings.fhKey = inFh.value.trim();
+        Market.setFhKey(data.settings.fhKey);
+        market.updatedAt = null;
+        persist(); toast(data.settings.fhKey ? '已儲存 Finnhub Key，改用即時報價' : '已清除 Finnhub Key，改回收盤價'); refreshPrices();
+      } }, '儲存')),
+    h('span', { class: 'hint' }, '到 finnhub.io 免費註冊後，在 Dashboard 複製 API Key 貼上。填了之後持股改用即時價（美股盤中約每分鐘更新），查不到的代號仍用 FinMind 收盤價；歷史曲線仍用 FinMind 日收盤。Key 跟帳本一起加密保存在這台裝置，不會同步到雲端。')));
   const inFxM = numInput('fx-manual', data.settings.fxManual || '', '例如 32.15');
   box.appendChild(h('div', { class: 'field' }, h('label', { for: 'fx-manual' }, '手動匯率（選填，1 美元 = 幾元台幣）'),
     h('div', { class: 'inline' }, inFxM,
